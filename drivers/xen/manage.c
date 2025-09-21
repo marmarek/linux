@@ -14,6 +14,7 @@
 #include <linux/freezer.h>
 #include <linux/syscore_ops.h>
 #include <linux/export.h>
+#include <linux/suspend.h>
 
 #include <xen/xen.h>
 #include <xen/xenbus.h>
@@ -66,11 +67,13 @@ static int xen_suspend(void *data)
 
 	BUG_ON(!irqs_disabled());
 
-	err = syscore_suspend();
+/*
+    err = syscore_suspend();
 	if (err) {
 		pr_err("%s: system core suspend failed: %d\n", __func__, err);
 		return err;
 	}
+*/
 
 	gnttab_suspend();
 	xen_manage_runstate_time(-1);
@@ -84,13 +87,94 @@ static int xen_suspend(void *data)
 	xen_manage_runstate_time(si->cancelled ? 1 : 0);
 	gnttab_resume();
 
-	if (!si->cancelled) {
+	//syscore_resume();
+
+	return 0;
+}
+
+static int xen_suspend_enter(suspend_state_t pm_state)
+{
+	struct suspend_info si;
+    int err;
+
+    switch (pm_state) {
+        case PM_SUSPEND_ON:
+        case PM_SUSPEND_STANDBY:
+        case PM_SUSPEND_MEM:
+            break;
+        default:
+            return -EINVAL;
+    }
+	xen_arch_suspend();
+
+	si.cancelled = 1;
+
+	err = stop_machine(xen_suspend, &si, cpumask_of(0));
+
+	/* Resume console as early as possible. */
+	if (!si.cancelled)
+		xen_console_resume();
+
+	raw_notifier_call_chain(&xen_resume_notifier, 0, NULL);
+
+	xen_arch_resume();
+
+    return err;
+}
+
+static int xen_suspend_state_valid(suspend_state_t pm_state)
+{
+	switch (pm_state) {
+		case PM_SUSPEND_ON:
+		case PM_SUSPEND_STANDBY:
+		//case PM_SUSPEND_MEM:
+			return 1;
+		default:
+			return 0;
+	}
+}
+
+static const struct platform_suspend_ops xen_suspend_ops = {
+	.valid = xen_suspend_state_valid,
+	//.begin = xen_suspend_begin,
+	.enter = xen_suspend_enter,
+	//.wake = xen_pm_finish,
+	//.end = xen_pm_end,
+	//.recover = xen_pm_finish,
+};
+
+static int xen_suspend_xs(void)
+{
+	printk(KERN_DEBUG "suspending xenstore...\n");
+	xs_suspend();
+	return 0;
+}
+
+static void xen_resume_xs(void)
+{
+	printk(KERN_DEBUG "resuming xenstore...\n");
+	xs_resume();
+
+	printk(KERN_DEBUG "enabling IRQ...\n");
+	if (1 /*FIXME !si->cancelled*/) {
 		xen_irq_resume();
 		xen_timer_resume();
 	}
 
-	syscore_resume();
+	// TODO: else xs_suspend_cancel();
+}
 
+static struct syscore_ops xen_sleep_syscore_ops = {
+	.suspend = xen_suspend_xs,
+	.resume = xen_resume_xs,
+};
+
+static int xen_suspend_register(void)
+{
+	// TODO: check if !hardware domain ?
+	register_syscore_ops(&xen_sleep_syscore_ops);
+	suspend_set_ops(&xen_suspend_ops);
+	// FIXME: error handling
 	return 0;
 }
 
@@ -100,6 +184,14 @@ static void do_suspend(void)
 	struct suspend_info si;
 
 	shutting_down = SHUTDOWN_SUSPEND;
+
+	err = pm_suspend(PM_SUSPEND_STANDBY);
+	if (err) {
+		pr_err("%s: pm_suspend failed %d\n", __func__, err);
+		goto out;
+	}
+	goto out;
+
 
 	err = freeze_processes();
 	if (err) {
@@ -388,3 +480,4 @@ int xen_setup_shutdown_event(void)
 EXPORT_SYMBOL_GPL(xen_setup_shutdown_event);
 
 subsys_initcall(xen_setup_shutdown_event);
+subsys_initcall(xen_suspend_register);
